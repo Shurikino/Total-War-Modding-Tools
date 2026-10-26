@@ -1,7 +1,7 @@
 # twdll for Thrones of Britannia (Thrones Reforged)
 
 `twdll_thrones.dll` is a required engine fix for **Total War Saga: Thrones of Britannia**,
-made for the [Thrones Reforged](STEAM_WORKSHOP_URL) mod by ShuriK. It is a fork of
+made for the [Thrones Reforged](https://steamcommunity.com/sharedfiles/filedetails/?id=3397195419) mod by ShuriK. It is a fork of
 [bukowa/twdll](https://github.com/bukowa/twdll) (GPL-3.0) with Thrones-specific engine fixes in
 [`src/thrones/`](src/thrones/).
 
