@@ -37,7 +37,7 @@ file(GLOB_RECURSE TWDLL_GAME_SOURCES CONFIGURE_DEPENDS "src/${TW_GAME}/*.cpp")
 add_library(twdll SHARED
     ${TWDLL_COMMON_SOURCES}
     ${TWDLL_GAME_SOURCES}
-)
+ "src/thrones/pathfinder.cpp" "src/thrones/overlay_fix.cpp" "src/thrones/dbkey_cache.cpp")
 
 target_include_directories(twdll PRIVATE src)
 target_link_libraries(twdll PRIVATE minhook)

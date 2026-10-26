@@ -6,6 +6,9 @@
 [![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](LICENSE)
 [![Discord](https://img.shields.io/badge/Discord-Join%20Chat-5865F2?logo=discord&logoColor=white)](https://discord.gg/6vm2M94vhX)
 
+> **Thrones of Britannia / Thrones Reforged:** this fork adds engine performance fixes for Thrones of Britannia.
+> See [THRONES.md](THRONES.md) for what they do, how to install, and how to verify the download.
+
 Run custom C++ code inside Total War: Attila's Lua engine. (Rome 2 support is frozen.)
 
 ## Installation

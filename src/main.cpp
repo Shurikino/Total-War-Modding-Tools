@@ -49,10 +49,10 @@ static const char* dll_reason_name(DWORD reason) {
     }
 }
 
+
 BOOL APIENTRY DllMain(const HMODULE hModule, const DWORD reason, LPVOID) {
-    Log("DllMain() called, reason=%u (%s)", reason, dll_reason_name(reason));
     if (reason == DLL_PROCESS_ATTACH) {
-        Log("DllMain() PROCESS_ATTACH: disabling thread attach/detach calls");
+        Log("[twdll] loaded (%s)", dll_reason_name(reason));
         DisableThreadLibraryCalls(hModule);
     }
     return TRUE;
