@@ -104,8 +104,12 @@ char *DispatchCommon(int slot,
     PosKey now{f[0xec / 4], f[0xf0 / 4], f[0xf4 / 4], f[0xf8 / 4]};
     DWORD nowTick = GetTickCount();
 
-    constexpr DWORD kCacheMaxAgeMs = 500;
-    constexpr DWORD kFullClearIntervalMs = 30000;
+    // The game restarts this search every frame to redraw the movement-range zone. With
+    // Thrones Reforged ranges one run takes up to ~17 ms, so the result is kept until the army
+    // or its destination moves. Accepted side effect: the movement-range zone is not drawn
+    // (route arrows use a separate search and stay exact).
+    constexpr DWORD kCacheMaxAgeMs = 600000;
+    constexpr DWORD kFullClearIntervalMs = 600000;
 
     {
         std::lock_guard<std::mutex> lock(g_lastSeenMutex);
@@ -119,7 +123,9 @@ char *DispatchCommon(int slot,
         if (g_pf8.lastReport == 0)
             g_pf8.lastReport = nowTick;
         if (nowTick - g_pf8.lastReport >= 5000) {
-            if constexpr (TWDLL_DEBUG_STATS != 0) Log("[twdll] [PF8] last 5s: calls %ld, hits %ld, miss new %ld / pos %ld / age %ld, "
+            static LONG s_reports = 0;
+            if (g_pf8.missNew + g_pf8.missPos + g_pf8.missAge > 0 && s_reports++ < 60)
+                Log("[twdll] [PF8] last 5s: calls %ld, hits %ld, miss new %ld / pos %ld / age %ld, "
                 "original %.0f ms total (max %.0f ms)",
                 g_pf8.calls,
                 g_pf8.hits,

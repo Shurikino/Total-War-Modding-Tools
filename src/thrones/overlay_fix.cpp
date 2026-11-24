@@ -6,11 +6,16 @@
 //  A  FUN_1158db60 : linear find per neighbour over the reachable set  -> hash lookup
 //  B  FUN_11591fc0 : border tessellation                                -> skipped for huge zones
 //  C  FUN_11622340 / FUN_11621fd0 / FUN_11622190 : linear finds         -> hash lookup
+//
+// Route arrows and "can reach" checks always use the game's own exact search (the earlier
+// drag-preview shortcut, a weighted estimate, could turn reachable arrows red).
 
 #include <windows.h>
 #include <cstdint>
 #include <unordered_map>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 
 #include "../common/log.h"
 
@@ -27,8 +32,6 @@ static constexpr uintptr_t FN_CAN_REACH =
 static constexpr DWORD kHoverMaxAgeMs = 1000;
 volatile LONG g_hover_gen = 0; // bumped by pathfinder.cpp on every move order (slots 0-7)
 static uintptr_t g_orig_can_reach = 0;
-static volatile DWORD g_heurThread =
-    0; // thread id of a search that may use the fast heuristic, 0 = off
 // Zones with more interior cells than this skip border tessellation (FUN_11591fc0).
 static DWORD g_border_threshold = 20000;
 
@@ -122,7 +125,8 @@ struct HoverEntry {
 };
 static HoverEntry s_hover = {};
 
-static LONG s_hCalls = 0, s_hHits = 0;
+static LONG s_hCalls = 0, s_hHits = 0, s_hvRuns = 0;
+static double s_hvMs = 0.0;
 static double s_hOrigMs = 0.0, s_hMaxMs = 0.0;
 static DWORD s_hLastReport = 0;
 
@@ -134,6 +138,655 @@ static double hover_qpc_ms(LONGLONG ticks) {
     }();
     return static_cast<double>(ticks) * 1000.0 / static_cast<double>(freq);
 }
+
+// ---------------------------------------------------------------------------
+// [SEARCH] diagnostics (log only, behaviour unchanged): which of the game's 12 route-search loops
+// run while the arrow is dragged, and how many hexes each takes off its open list. Each loop has
+// exactly one caller and one heap pop (FUN_106c0cd0); both CALLs are counted, then the original
+// runs as before. Counts only while the arrow route (drag_b) is being computed.
+// ---------------------------------------------------------------------------
+static constexpr uintptr_t FN_HEAP_POP = 0x106C0CD0;
+static constexpr int kLoops = 12;
+static const uintptr_t kLoopFn[kLoops] = {0x106B8010, 0x106B8260, 0x106B84B0, 0x106B8700, 0x10A0E0F0, 0x10A0E360, 0x10AA3590, 0x10AA3800, 0x10B331B0, 0x10B33440, 0x10B336D0, 0x10B33920};
+static volatile LONG g_inArrow = 0;   // 1 while the arrow route search runs
+static LONG g_loopRuns[kLoops] = {};  // loop entries during the arrow
+static LONG g_loopPops[kLoops] = {};  // hexes popped during the arrow
+static uintptr_t g_loopOrig[kLoops] = {};
+static uintptr_t g_popOrig = 0;
+
+static __declspec(naked) void loop_run_0() {
+    __asm {
+        push eax
+        mov  eax, g_inArrow
+        add  dword ptr [g_loopRuns + 0], eax
+        pop  eax
+        jmp  dword ptr [g_loopOrig + 0]
+    }
+}
+static __declspec(naked) void loop_pop_0() {
+    __asm {
+        push eax
+        mov  eax, g_inArrow
+        add  dword ptr [g_loopPops + 0], eax
+        pop  eax
+        jmp  dword ptr [g_popOrig]
+    }
+}
+
+static __declspec(naked) void loop_run_1() {
+    __asm {
+        push eax
+        mov  eax, g_inArrow
+        add  dword ptr [g_loopRuns + 4], eax
+        pop  eax
+        jmp  dword ptr [g_loopOrig + 4]
+    }
+}
+static __declspec(naked) void loop_pop_1() {
+    __asm {
+        push eax
+        mov  eax, g_inArrow
+        add  dword ptr [g_loopPops + 4], eax
+        pop  eax
+        jmp  dword ptr [g_popOrig]
+    }
+}
+
+static __declspec(naked) void loop_run_2() {
+    __asm {
+        push eax
+        mov  eax, g_inArrow
+        add  dword ptr [g_loopRuns + 8], eax
+        pop  eax
+        jmp  dword ptr [g_loopOrig + 8]
+    }
+}
+static __declspec(naked) void loop_pop_2() {
+    __asm {
+        push eax
+        mov  eax, g_inArrow
+        add  dword ptr [g_loopPops + 8], eax
+        pop  eax
+        jmp  dword ptr [g_popOrig]
+    }
+}
+
+static __declspec(naked) void loop_run_3() {
+    __asm {
+        push eax
+        mov  eax, g_inArrow
+        add  dword ptr [g_loopRuns + 12], eax
+        pop  eax
+        jmp  dword ptr [g_loopOrig + 12]
+    }
+}
+static __declspec(naked) void loop_pop_3() {
+    __asm {
+        push eax
+        mov  eax, g_inArrow
+        add  dword ptr [g_loopPops + 12], eax
+        pop  eax
+        jmp  dword ptr [g_popOrig]
+    }
+}
+
+static __declspec(naked) void loop_pop_4() {
+    __asm {
+        push eax
+        mov  eax, g_inArrow
+        add  dword ptr [g_loopPops + 16], eax
+        pop  eax
+        jmp  dword ptr [g_popOrig]
+    }
+}
+
+static __declspec(naked) void loop_pop_5() {
+    __asm {
+        push eax
+        mov  eax, g_inArrow
+        add  dword ptr [g_loopPops + 20], eax
+        pop  eax
+        jmp  dword ptr [g_popOrig]
+    }
+}
+
+static __declspec(naked) void loop_run_6() {
+    __asm {
+        push eax
+        mov  eax, g_inArrow
+        add  dword ptr [g_loopRuns + 24], eax
+        pop  eax
+        jmp  dword ptr [g_loopOrig + 24]
+    }
+}
+static __declspec(naked) void loop_pop_6() {
+    __asm {
+        push eax
+        mov  eax, g_inArrow
+        add  dword ptr [g_loopPops + 24], eax
+        pop  eax
+        jmp  dword ptr [g_popOrig]
+    }
+}
+
+static __declspec(naked) void loop_run_7() {
+    __asm {
+        push eax
+        mov  eax, g_inArrow
+        add  dword ptr [g_loopRuns + 28], eax
+        pop  eax
+        jmp  dword ptr [g_loopOrig + 28]
+    }
+}
+static __declspec(naked) void loop_pop_7() {
+    __asm {
+        push eax
+        mov  eax, g_inArrow
+        add  dword ptr [g_loopPops + 28], eax
+        pop  eax
+        jmp  dword ptr [g_popOrig]
+    }
+}
+
+static __declspec(naked) void loop_pop_8() {
+    __asm {
+        push eax
+        mov  eax, g_inArrow
+        add  dword ptr [g_loopPops + 32], eax
+        pop  eax
+        jmp  dword ptr [g_popOrig]
+    }
+}
+
+static __declspec(naked) void loop_run_9() {
+    __asm {
+        push eax
+        mov  eax, g_inArrow
+        add  dword ptr [g_loopRuns + 36], eax
+        pop  eax
+        jmp  dword ptr [g_loopOrig + 36]
+    }
+}
+static __declspec(naked) void loop_pop_9() {
+    __asm {
+        push eax
+        mov  eax, g_inArrow
+        add  dword ptr [g_loopPops + 36], eax
+        pop  eax
+        jmp  dword ptr [g_popOrig]
+    }
+}
+
+static __declspec(naked) void loop_run_10() {
+    __asm {
+        push eax
+        mov  eax, g_inArrow
+        add  dword ptr [g_loopRuns + 40], eax
+        pop  eax
+        jmp  dword ptr [g_loopOrig + 40]
+    }
+}
+static __declspec(naked) void loop_pop_10() {
+    __asm {
+        push eax
+        mov  eax, g_inArrow
+        add  dword ptr [g_loopPops + 40], eax
+        pop  eax
+        jmp  dword ptr [g_popOrig]
+    }
+}
+
+static __declspec(naked) void loop_run_11() {
+    __asm {
+        push eax
+        mov  eax, g_inArrow
+        add  dword ptr [g_loopRuns + 44], eax
+        pop  eax
+        jmp  dword ptr [g_loopOrig + 44]
+    }
+}
+static __declspec(naked) void loop_pop_11() {
+    __asm {
+        push eax
+        mov  eax, g_inArrow
+        add  dword ptr [g_loopPops + 44], eax
+        pop  eax
+        jmp  dword ptr [g_popOrig]
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Exact A* guide for the arrow route and the hover "can reach" check.
+// The [SEARCH] log showed where an arrow route spends its time: one main search FUN_10a0e0f0
+// (30-55k hexes) and ~50 short searches FUN_10b331b0 while the route is refined (~3k hexes
+// each). The hover check uses FUN_10a0e0f0 / FUN_10a0e360. In all three loops (verified):
+//   - the loop stops when it pops the one goal hex (FUN_10a0e0f0 / 10a0e360: node == *arg3;
+//     FUN_10b331b0: FUN_10b670d0, node == *(goal object) = *arg3)
+//   - the heuristic (FUN_10b97020, called at 106B7CAE or 10B9700A) gets that same hex as target
+//   - the only expansions are FUN_106ba9f0 / 106bab30 / 106bac70 and the relax steps
+//     FUN_106e4450 / 106e45b0 / 106e4710 add the step to the parent's cost (budget check aside)
+//     and reopen a hex when it is reached cheaper.
+// The game's heuristic is a landmass-to-landmass table (word +6 of the hex record, low 12 bits),
+// the same for every hex of one landmass, so inside a landmass these searches flood in every
+// direction like Dijkstra. Every step cost those expansions can add:
+//   - neighbour step: stepCost[b] (graph+0x37C, 256 dwords), b = byte s of the hex record,
+//     taken only if (b & mask) == mask (mask = byte at graph+0x7BC)
+//   - crossing between two type-5 hexes (word +6, top nibble 5): 0x1F4 = 500
+// So from a hex on the goal's landmass the remaining cost is at least
+//   min( minStep * hexDistance(hex, goal),  500 + minStep * hexDistance(nearest type-5, goal) )
+// That is added to the game's own value. It never overestimates and it is 0 at the goal, so A*
+// still returns the cheapest route: the same cost as vanilla, so the same red/yellow
+// (equal-cost alternatives may be drawn along a different line).
+// The map layout is checked at runtime; if anything does not match, the guide stays off.
+// Switches (game folder): twdll_arrow_exact_off.txt = vanilla search,
+//                         twdll_arrow_verify.txt   = run every hover check both ways, log diffs.
+// ---------------------------------------------------------------------------
+static constexpr uintptr_t FN_HEUR = 0x10B97020; // __thiscall(graph, int idx, int target), ret 8
+typedef int(__thiscall *Heur_t)(void *graph, int idx, int target);
+static uintptr_t g_orig_heur = 0;
+static constexpr uintptr_t FN_HEX_DIST = 0x10B97320; // __cdecl int(coordA, coordB), coord = y<<16 | x
+typedef int(__cdecl *HexDist_t)(uint32_t a, uint32_t b);
+static uintptr_t g_hex_dist = 0;
+static volatile DWORD g_guideThread = 0; // thread inside one of the three verified loops
+static volatile DWORD g_guideWant = 0;   // thread of an arrow / hover check that wants it
+static bool g_guideOn = true;
+static bool g_guideVerify = false;
+static LONG s_searchSerial = 0;
+
+struct GuideGraph {
+    const char *graph;
+    const uint8_t *recs;
+    uint32_t width, count;
+    uint8_t mask;
+    uint32_t tableSum;
+    int layout;  // 0 = odd columns shifted down, 1 = even columns shifted down
+    int minStep;
+    bool ok;
+    LONG serial; // search this state was checked for
+    int *portalQ;
+    int *portalR;
+    uint32_t portals;
+    char info[200];  // step classes for the log
+    int target;      // cached per target:
+    int targetQ, targetR, targetZone, portalBound;
+};
+static GuideGraph s_ggs[4] = {}; // one per graph (unit / movement type), reused
+static GuideGraph *s_cur = &s_ggs[0];
+static unsigned s_ggNext = 0;
+static LONG s_guideLogs = 0;
+static LONG s_guideUsed = 0, s_guideCalls = 0, s_guideSample = 0, s_guideRaw = 0;
+static LONG s_verifyRuns = 0, s_verifyDiffs = 0, s_verifyFloatDiffs = 0;
+
+static inline int iabs(int v) {
+    return v < 0 ? -v : v;
+}
+
+static inline void to_cube(int layout, uint32_t idx, uint32_t w, int &q, int &r) {
+    const int x = static_cast<int>(idx % w), y = static_cast<int>(idx / w);
+    q = x;
+    r = layout == 0 ? y - (x - (x & 1)) / 2 : y - (x + (x & 1)) / 2;
+}
+
+static inline int cube_dist(int q1, int r1, int q2, int r2) {
+    const int dq = q1 - q2, dr = r1 - r2;
+    return (iabs(dq) + iabs(dr) + iabs(dq + dr)) / 2;
+}
+
+static bool same_set(const int *got, const int *want) {
+    bool used[6] = {};
+    for (int i = 0; i < 6; ++i) {
+        bool found = false;
+        for (int j = 0; j < 6; ++j)
+            if (!used[j] && got[j] == want[i]) {
+                used[j] = true;
+                found = true;
+                break;
+            }
+        if (!found)
+            return false;
+    }
+    return true;
+}
+
+static uint32_t table_sum(const char *g) {
+    const uint32_t *t = reinterpret_cast<const uint32_t *>(g + 0x37C);
+    uint32_t s = 0;
+    for (int i = 0; i < 256; ++i)
+        s = s * 31 + t[i];
+    return s;
+}
+
+// Full check of one graph. Plain data only (SEH). Returns a reason string, or nullptr if usable.
+static const char *guide_setup_inner(GuideGraph &e, const char *g) {
+    __try {
+        free(e.portalQ);
+        free(e.portalR);
+        e = GuideGraph{};
+        e.graph = g;
+        const uint32_t w = *reinterpret_cast<const uint32_t *>(g + 0x6C);
+        const uint32_t cap = *reinterpret_cast<const uint32_t *>(g + 0xA4);
+        const uint32_t size = *reinterpret_cast<const uint32_t *>(g + 0xA8);
+        const uint8_t *recs = *reinterpret_cast<const uint8_t *const *>(g + 0xAC);
+        const uint8_t mask = *reinterpret_cast<const uint8_t *>(g + 0x7BC);
+        const int *step = reinterpret_cast<const int *>(g + 0x37C);
+        const int *off = reinterpret_cast<const int *>(g + 0x77C); // [parity * 6 + dir]
+        e.width = w;
+        e.count = size;
+        e.recs = recs;
+        e.mask = mask;
+        e.tableSum = table_sum(g);
+        if (w < 2 || w > 65535 || (w & 1))
+            return "grid width";
+        if (!recs || size < w || size % w || size > 16000000 || cap < size)
+            return "hex array";
+        const int iw = static_cast<int>(w);
+        const int oddEven[6] = {-iw, iw, -iw - 1, -iw + 1, -1, 1};
+        const int oddOdd[6] = {-iw, iw, -1, 1, iw - 1, iw + 1};
+        if (same_set(off, oddEven) && same_set(off + 6, oddOdd))
+            e.layout = 0;
+        else if (same_set(off, oddOdd) && same_set(off + 6, oddEven))
+            e.layout = 1;
+        else
+            return "neighbour layout";
+        // Only step classes that occur in the hex records can ever be taken.
+        uint32_t uses[256] = {};
+        for (uint32_t i = 0; i < size; ++i) {
+            const uint8_t *rec = recs + static_cast<size_t>(i) * 8;
+            for (int d = 0; d < 6; ++d)
+                ++uses[rec[d]];
+        }
+        int minStep = 0x7FFFFFFF;
+        {
+            // Log line: passable classes, cheapest first: class=cost(steps on the map)
+            bool shown[256] = {};
+            int len = 0;
+            for (int k = 0; k < 12; ++k) {
+                int best = -1;
+                for (int b = 0; b < 256; ++b)
+                    if (!shown[b] && uses[b] && (b & mask) == mask && (best < 0 || step[b] < step[best]))
+                        best = b;
+                if (best < 0)
+                    break;
+                shown[best] = true;
+                const int n = snprintf(e.info + len,
+                                       sizeof(e.info) - len,
+                                       "%s%02X=%d(%u)",
+                                       len ? " " : "",
+                                       best,
+                                       step[best],
+                                       uses[best]);
+                if (n < 0 || len + n >= static_cast<int>(sizeof(e.info)) - 1)
+                    break;
+                len += n;
+            }
+        }
+        for (int b = 0; b < 256; ++b) {
+            if (!uses[b] || (b & mask) != mask)
+                continue;
+            if (step[b] < 0)
+                return "negative step cost";
+            if (step[b] < minStep)
+                minStep = step[b];
+        }
+        if (minStep == 0x7FFFFFFF || minStep <= 0)
+            return "zero step cost";
+        e.minStep = minStep;
+        // Our hex distance must equal the game's own (FUN_10b97320) on a spread of hex pairs.
+        if (!g_hex_dist)
+            return "no distance function";
+        {
+            uint32_t seed = 12345;
+            for (int t = 0; t < 4000; ++t) {
+                seed = seed * 1103515245u + 12345u;
+                const uint32_t i = (seed >> 4) % size;
+                seed = seed * 1103515245u + 12345u;
+                uint32_t j = (seed >> 4) % size;
+                if (t % 4 == 0)
+                    j = i + (static_cast<uint32_t>(t / 4) % 7) - 3 + w * ((static_cast<uint32_t>(t / 4) / 7) % 7 - 3);
+                if (j >= size)
+                    continue;
+                int q1, r1, q2, r2;
+                to_cube(e.layout, i, w, q1, r1);
+                to_cube(e.layout, j, w, q2, r2);
+                const uint32_t ci = ((i / w) << 16) | (i % w), cj = ((j / w) << 16) | (j % w);
+                const int mine = cube_dist(q1, r1, q2, r2);
+                const int game = reinterpret_cast<HexDist_t>(g_hex_dist)(ci, cj);
+                if (mine != game)
+                    return "hex distance differs from the game's";
+            }
+        }
+        // Type-5 hexes, and no passable step that wraps around a map edge.
+        const uint32_t rows = size / w;
+        uint32_t portals = 0;
+        for (uint32_t i = 0; i < size; ++i) {
+            const uint8_t *rec = recs + static_cast<size_t>(i) * 8;
+            if ((*reinterpret_cast<const uint16_t *>(rec + 6) & 0xF000) == 0x5000)
+                ++portals;
+            const uint32_t x = i % w, y = i / w;
+            if (x != 0 && x != w - 1 && y != 0 && y != rows - 1)
+                continue;
+            const int *o = off + (i & 1) * 6;
+            for (int s = 0; s < 6; ++s) {
+                if ((rec[s] & mask) != mask)
+                    continue;
+                const int d = o[s];
+                const bool left = d == -1 || d == -iw - 1 || d == iw - 1;
+                const bool right = d == 1 || d == -iw + 1 || d == iw + 1;
+                const bool up = d == -iw || d == -iw - 1 || d == -iw + 1;
+                const bool down = d == iw || d == iw - 1 || d == iw + 1;
+                if ((x == 0 && left) || (x == w - 1 && right) || (y == 0 && up) ||
+                    (y == rows - 1 && down))
+                    return "passable map edge";
+            }
+        }
+        if (portals) {
+            e.portalQ = static_cast<int *>(malloc(sizeof(int) * portals));
+            e.portalR = static_cast<int *>(malloc(sizeof(int) * portals));
+            if (!e.portalQ || !e.portalR)
+                return "out of memory";
+            uint32_t k = 0;
+            for (uint32_t i = 0; i < size && k < portals; ++i) {
+                const uint8_t *rec = recs + static_cast<size_t>(i) * 8;
+                if ((*reinterpret_cast<const uint16_t *>(rec + 6) & 0xF000) == 0x5000) {
+                    to_cube(e.layout, i, w, e.portalQ[k], e.portalR[k]);
+                    ++k;
+                }
+            }
+        }
+        e.portals = portals;
+        e.target = -1;
+        e.ok = true;
+        return nullptr;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        e.ok = false;
+        return "memory fault";
+    }
+}
+
+// Once per search: re-check the cheap parts, redo the full check if the graph changed.
+static bool guide_check_same(const GuideGraph &e, const char *g) {
+    __try {
+        return e.graph == g && e.mask == *reinterpret_cast<const uint8_t *>(g + 0x7BC) &&
+               e.width == *reinterpret_cast<const uint32_t *>(g + 0x6C) &&
+               e.count == *reinterpret_cast<const uint32_t *>(g + 0xA8) &&
+               e.recs == *reinterpret_cast<const uint8_t *const *>(g + 0xAC) &&
+               e.tableSum == table_sum(g);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static bool guide_ready(const char *g) {
+    const LONG serial = s_searchSerial;
+    if (s_cur->serial == serial && s_cur->graph == g)
+        return s_cur->ok;
+    GuideGraph *e = nullptr;
+    for (GuideGraph &c : s_ggs)
+        if (c.graph == g) {
+            e = &c;
+            break;
+        }
+    if (!e) {
+        e = &s_ggs[s_ggNext++ % 4];
+        e->graph = nullptr;
+    }
+    if (!guide_check_same(*e, g)) {
+        LARGE_INTEGER t0, t1;
+        QueryPerformanceCounter(&t0);
+        const char *why = guide_setup_inner(*e, g);
+        QueryPerformanceCounter(&t1);
+        e->graph = g;
+        if (InterlockedIncrement(&s_guideLogs) <= 20) {
+            if (why)
+                Log("[twdll] [ARROW] exact guide OFF for graph %p: %s (vanilla search used) | step classes: %s",
+                    g,
+                    why,
+                    e->info);
+            else
+                Log("[twdll] [ARROW] exact guide ON: graph %p, %u x %u hexes, mask %02X, cheapest step %d, "
+                    "layout %s, %u crossing hexes, checked in %.1f ms | step classes: %s",
+                    g,
+                    e->width,
+                    e->count / e->width,
+                    static_cast<unsigned int>(e->mask),
+                    e->minStep,
+                    e->layout == 0 ? "odd-q" : "even-q",
+                    e->portals,
+                    hover_qpc_ms(t1.QuadPart - t0.QuadPart),
+                    e->info);
+        }
+    }
+    e->serial = serial;
+    e->target = -1;
+    s_cur = e;
+    return e->ok;
+}
+
+static int guide_h(void *graph, int idx, int target) {
+    const int h = reinterpret_cast<Heur_t>(g_orig_heur)(graph, idx, target);
+    if (g_guideThread == 0 || g_guideThread != GetCurrentThreadId())
+        return h;
+    ++s_guideCalls;
+    if (s_guideRaw < 6) {
+        ++s_guideRaw;
+        Log("[twdll] [ARROW] game heuristic value: hex %d -> target %d = %d (0x%08X)",
+            idx, target, h, static_cast<unsigned int>(h));
+    }
+    const char *g = static_cast<const char *>(graph);
+    if (!g || !guide_ready(g))
+        return h;
+    const uint32_t ui = static_cast<uint32_t>(idx), ut = static_cast<uint32_t>(target);
+    if (ui >= s_cur->count || ut >= s_cur->count)
+        return h;
+    if (s_cur->target != target) {
+        s_cur->target = target;
+        to_cube(s_cur->layout, ut, s_cur->width, s_cur->targetQ, s_cur->targetR);
+        s_cur->targetZone =
+            *reinterpret_cast<const uint16_t *>(s_cur->recs + static_cast<size_t>(ut) * 8 + 6) & 0xFFF;
+        int best = 0x7FFFFFFF;
+        for (uint32_t k = 0; k < s_cur->portals; ++k) {
+            const int d = cube_dist(s_cur->portalQ[k], s_cur->portalR[k], s_cur->targetQ, s_cur->targetR);
+            if (d < best)
+                best = d;
+        }
+        long long pb = s_cur->portals ? 500LL + static_cast<long long>(s_cur->minStep) * best : 0x3FFFFFFFLL;
+        s_cur->portalBound = pb > 0x3FFFFFFF ? 0x3FFFFFFF : static_cast<int>(pb);
+    }
+    const int zone =
+        *reinterpret_cast<const uint16_t *>(s_cur->recs + static_cast<size_t>(ui) * 8 + 6) & 0xFFF;
+    if (zone != s_cur->targetZone)
+        return h; // other landmass: the game's own value only
+    int q, r;
+    to_cube(s_cur->layout, ui, s_cur->width, q, r);
+    long long add = static_cast<long long>(s_cur->minStep) * cube_dist(q, r, s_cur->targetQ, s_cur->targetR);
+    if (add > s_cur->portalBound)
+        add = s_cur->portalBound;
+    ++s_guideUsed;
+    if (s_guideSample < 8) {
+        ++s_guideSample;
+        Log("[twdll] [ARROW] guide sample: hex %d -> target %d, game value %d, added %lld",
+            idx, target, h, add);
+    }
+    // The heap compares priority = cost + heuristic as UNSIGNED 32-bit (FUN_106b7e50 / 106b7e60),
+    // and the game's own value is the same for every hex of the landmass. Adding our bound keeps
+    // the order exact as long as cost + value + bound never wraps past 2^32 for one hex but not
+    // another:
+    //  - value small enough that value + bound + 0x10000000 (cost headroom) stays below 2^32, or
+    //  - value = -k with k <= cheapest step and <= 500: every hex but the start has cost >= k, so
+    //    all of them wrap the same way (vanilla's start hex already sits at -k).
+    // Anything else: the game's value alone.
+    const unsigned long long H = static_cast<uint32_t>(h);
+    const unsigned long long A = static_cast<unsigned long long>(add);
+    const unsigned long long k = 0x100000000ULL - H;
+    if (H + A + 0x10000000ULL <= 0xFFFFFFFFULL ||
+        (H > 0xFFFF0000ULL && k <= static_cast<unsigned long long>(s_cur->minStep) && k <= 500ULL))
+        return static_cast<int>(static_cast<uint32_t>(H + A));
+    --s_guideUsed;
+    return h;
+}
+
+// __fastcall with a dummy EDX == __thiscall layout; callee pops the 2 stack args (ret 8).
+static int __fastcall guide_site_a(void *graph, void * /*edx*/, int idx, int target) {
+    return guide_h(graph, idx, target); // 10B9700A, FUN_10b97000 (relax FUN_106e4710)
+}
+static int __fastcall guide_site_b(void *graph, void * /*edx*/, int idx, int target) {
+    return guide_h(graph, idx, target); // 106B7CAE, FUN_106b7ca0 (relax FUN_106e4450 / 45b0)
+}
+
+// The verified loops (all __thiscall, 6 stack args, ret 0x18). Guided only when an arrow / hover
+// check on this thread asked for it; every other search (AI, orders, zone) runs as before.
+typedef void *(__thiscall *Loop_t)(
+    void *s, void *res, uint32_t a1, uint32_t a2, void *goal, uint32_t a4, void *a5);
+
+static void *guided_loop(int slot,
+                         void *s,
+                         void *res,
+                         uint32_t a1,
+                         uint32_t a2,
+                         void *goal,
+                         uint32_t a4,
+                         void *a5) {
+    g_loopRuns[slot] += g_inArrow;
+    const DWORD tid = GetCurrentThreadId();
+    const bool guided = g_guideOn && g_guideWant == tid;
+    const DWORD prev = g_guideThread;
+    if (guided) {
+        InterlockedIncrement(&s_searchSerial); // re-check the graph once per search
+        g_guideThread = tid;
+    }
+    void *r = reinterpret_cast<Loop_t>(g_loopOrig[slot])(s, res, a1, a2, goal, a4, a5);
+    if (guided)
+        g_guideThread = prev;
+    return r;
+}
+
+// __fastcall with a dummy EDX == __thiscall layout.
+static void *__fastcall loop_run_4(
+    void *s, void *, void *res, uint32_t a1, uint32_t a2, void *goal, uint32_t a4, void *a5) {
+    return guided_loop(4, s, res, a1, a2, goal, a4, a5); // FUN_10a0e0f0
+}
+static void *__fastcall loop_run_5(
+    void *s, void *, void *res, uint32_t a1, uint32_t a2, void *goal, uint32_t a4, void *a5) {
+    return guided_loop(5, s, res, a1, a2, goal, a4, a5); // FUN_10a0e360
+}
+static void *__fastcall loop_run_8(
+    void *s, void *, void *res, uint32_t a1, uint32_t a2, void *goal, uint32_t a4, void *a5) {
+    return guided_loop(8, s, res, a1, a2, goal, a4, a5); // FUN_10b331b0
+}
+
+// Arrow / hover check scope: searches started inside it may be guided.
+struct GuideScope {
+    DWORD prev;
+    bool on;
+    explicit GuideScope(bool enable) : prev(g_guideWant), on(enable && g_guideOn) {
+        if (on)
+            g_guideWant = GetCurrentThreadId();
+    }
+    ~GuideScope() {
+        if (on)
+            g_guideWant = prev;
+    }
+};
 
 // __fastcall with a dummy EDX == __thiscall layout; callee pops the 3 stack args (ret 0xC).
 static bool __fastcall hover_can_reach(
@@ -172,19 +825,45 @@ static bool __fastcall hover_can_reach(
 
     LARGE_INTEGER t0, t1;
     QueryPerformanceCounter(&t0);
-    // While RMB-dragging, the hover check may use the fast heuristic too: it only needs
-    // reachable yes/no, and weighted A* without re-expansion still finds a path if one exists.
-    const bool hoverFast = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
-    if (hoverFast)
-        g_heurThread = GetCurrentThreadId();
-    const bool r = reinterpret_cast<CanReach_t>(g_orig_can_reach)(pf, army, cell, ctx);
-    if (hoverFast)
-        g_heurThread = 0;
+    bool r;
+    if (g_guideVerify && g_guideOn) {
+        // Verify mode: vanilla first, then guided from the same state; compare.
+        const bool rv = reinterpret_cast<CanReach_t>(g_orig_can_reach)(pf, army, cell, ctx);
+        float fv[4];
+        std::memcpy(fv, pff, sizeof(fv));
+        std::memcpy(pff, before, sizeof(before));
+        {
+            GuideScope gs(true);
+            r = reinterpret_cast<CanReach_t>(g_orig_can_reach)(pf, army, cell, ctx);
+        }
+        ++s_verifyRuns;
+        if (rv != r) {
+            ++s_verifyDiffs;
+            if (s_verifyDiffs <= 50)
+                Log("[twdll] [VERIFY] DIFFERENT: army %d hex %08X vanilla says %s, guided says %s",
+                    army,
+                    static_cast<unsigned int>(c),
+                    rv ? "reachable" : "not reachable",
+                    r ? "reachable" : "not reachable");
+        } else if (std::memcmp(fv, pff, sizeof(fv)) != 0) {
+            ++s_verifyFloatDiffs;
+        }
+        if (s_verifyRuns % 100 == 0)
+            Log("[twdll] [VERIFY] %ld hover checks compared: %ld different answers, %ld other differences",
+                s_verifyRuns,
+                s_verifyDiffs,
+                s_verifyFloatDiffs);
+    } else {
+        GuideScope gs(true);
+        r = reinterpret_cast<CanReach_t>(g_orig_can_reach)(pf, army, cell, ctx);
+    }
     QueryPerformanceCounter(&t1);
     const double ms = hover_qpc_ms(t1.QuadPart - t0.QuadPart);
     s_hOrigMs += ms;
     if (ms > s_hMaxMs)
         s_hMaxMs = ms;
+    ++s_hvRuns;
+    s_hvMs += ms;
 
     s_hover.valid = true;
     s_hover.pf = pf;
@@ -201,118 +880,138 @@ static bool __fastcall hover_can_reach(
 }
 
 // ---------------------------------------------------------------------------
-// Distance-aware A* heuristic for the drag-arrow preview.
-// Node priority = g + FUN_10b97020(graph, nodeIdx, targetIdx) (called from FUN_10b97000 at
-// 10B9700A and from FUN_106b7ca0 at 106B7CAE). Log showed: original h is never 0 and never
-// below minStep * hexDistance, yet x2/x3 weighting changed nothing -> h is a huge, flat value
-// (zone table), so the search orders by g only and floods like Dijkstra.
-// While dragging we REPLACE h with minStep * hexDistanceLowerBound(node, target). That is
-// admissible (never overestimates normal steps), so the route cost stays optimal.
-//   graph+0x6c = grid width (808), node index = y * width + x.
-//   minStep = cheapest neighbour step seen at 106BACC6 (70).
-// Active only on the drag thread while RMB is held.
+// Route refinement memo (arrow only). After the main search, FUN_10b415d0 refines the arrow route
+// with ~50 short searches FUN_10b37080(res, path, from, to, arg) (call at 10B41788). Each one
+// starts fresh (FUN_10b37110: new stamp, empty open list) and leaves only res = {found, cost}
+// and the hexes in the path vector {cap, size, data}; FUN_10b415d0 reads nothing else. Moving the
+// cursor by a hex repeats most (from, to) pairs, and the same inputs on an unchanged map give the
+// same answer, so a repeated pair gets the saved answer. Saved answers are dropped when a drag
+// starts, after any move order (g_hover_gen) and after 2 s. twdll_arrow_memo_off.txt turns it
+// off; in verify mode every saved answer is also searched for real and compared ([MEMO] lines).
 // ---------------------------------------------------------------------------
-static constexpr uintptr_t FN_HEUR = 0x10B97020; // __thiscall(graph, int idx, int target), ret 8
-static constexpr uintptr_t FN_RELAX =
-    0x106E4710; // __thiscall(search, uint idx, int stepCost), ret 8
-static uintptr_t g_orig_heur = 0;
-static uintptr_t g_orig_relax = 0;
-static volatile LONG g_minStep = 0x7FFFFFFF; // cheapest neighbour step cost observed
-static LONG s_heurCalls = 0, s_geoUsed = 0, s_heurA = 0, s_heurB = 0;
-static long long s_stepSum = 0;
-static LONG s_stepCnt = 0;
-// Weight on the distance estimate (percent). 100 = exact-cost routes (admissible),
-// >100 = faster but the preview route may be slightly longer than optimal.
-static constexpr int kGeoWeightPct = 500;
-static LONG s_skipClosed = 0;
-static unsigned s_hMin = 0xFFFFFFFF, s_hMax = 0, s_lastWidth = 0;
-typedef int(__thiscall *Heur_t)(void *graph, int idx, int target);
-typedef void(__thiscall *Relax_t)(void *search, uint32_t idx, int cost);
+static constexpr uintptr_t FN_REFINE_SEARCH = 0x10B37080; // __thiscall, 5 stack args, ret 0x14
+static uintptr_t g_orig_refine = 0;
+typedef void *(__thiscall *Refine_t)(
+    void *s, void *res, uint32_t *vec, uint32_t from, uint32_t to, uint32_t arg);
+static bool g_memoOn = true;
 
-// Neighbour step relax (106BACC6). The cheapest step is learned ONLY from searches on the
-// fast (drag) thread, so AI / other unit types can't drag g_minStep down (seen: 70 -> 25).
-static void __fastcall relax_observe(void *search, void * /*edx*/, uint32_t idx, int cost) {
-    if (g_heurThread != 0 && g_heurThread == GetCurrentThreadId()) {
-        if (cost > 0 && cost < g_minStep)
-            InterlockedExchange(&g_minStep, cost);
-        s_stepSum += cost;
-        ++s_stepCnt;
-        // Weighted A* without re-expansion: never reopen a CLOSED hex during the preview.
-        // search = FUN_106c4d90 state: +0xC -> object whose +8 is the per-hex stamp array
-        // (ushort), +0x18 = this search's stamp. Closed = stamp | 2 (set in FUN_10b331b0).
-        const char *so = static_cast<const char *>(search);
-        const char *stampObj = *reinterpret_cast<const char *const *>(so + 0xC);
-        if (stampObj) {
-            const uint16_t *stamps = *reinterpret_cast<const uint16_t *const *>(stampObj + 8);
-            const uint16_t mine = *reinterpret_cast<const uint16_t *>(so + 0x18);
-            if (stamps) {
-                const uint16_t st = stamps[idx];
-                if ((st & 0xFFFC) == mine && (st & 3) == 2) {
-                    ++s_skipClosed;
-                    return;
-                }
-            }
-        }
+struct MemoEntry {
+    bool used;
+    void *s;
+    uint32_t *vec;
+    uint32_t from, to, arg;
+    uint32_t pos[4]; // graph+0xEC..0xF8 (start / goal position floats), as bits
+    uint32_t res[2];
+    uint32_t n;
+    uint32_t *hexes;
+};
+static constexpr int kMemo = 512;
+static MemoEntry s_memo[kMemo] = {};
+static unsigned s_memoNext = 0;
+static LONG s_memoGen = 0;
+static DWORD s_memoTick = 0;
+static LONG s_memoHits = 0, s_memoMiss = 0, s_memoNoRoom = 0, s_memoChecked = 0, s_memoDiffs = 0;
+
+static void memo_clear() {
+    for (MemoEntry &m : s_memo) {
+        free(m.hexes);
+        m = MemoEntry{};
     }
-    reinterpret_cast<Relax_t>(g_orig_relax)(search, idx, cost);
+    s_memoNext = 0;
 }
 
-static int hex_lower_bound(unsigned a, unsigned b, unsigned w) {
-    const int x1 = static_cast<int>(a % w), y1 = static_cast<int>(a / w);
-    const int x2 = static_cast<int>(b % w), y2 = static_cast<int>(b / w);
-    const int dx = x1 > x2 ? x1 - x2 : x2 - x1;
-    const int dy = y1 > y2 ? y1 - y2 : y2 - y1;
-    // Valid for both column-offset and row-offset hex layouts (take the weaker bound).
-    int bq = dy - (dx + 1) / 2;
-    if (bq < dx)
-        bq = dx;
-    int br = dx - (dy + 1) / 2;
-    if (br < dy)
-        br = dy;
-    const int d = bq < br ? bq : br;
-    return d > 0 ? d : 0;
+static bool memo_read_pos(void *s, uint32_t out[4]) {
+    __try {
+        const char *graph = *static_cast<const char *const *>(s);
+        std::memcpy(out, graph + 0xEC, 16);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
 }
 
-static int heur_geo(int site, void *graph, int idx, int target) {
-    const int h = reinterpret_cast<Heur_t>(g_orig_heur)(graph, idx, target);
-    if (g_heurThread == 0 || g_heurThread != GetCurrentThreadId())
-        return h;
-    ++s_heurCalls;
-    if (site == 0)
-        ++s_heurA;
-    else
-        ++s_heurB;
-    if (static_cast<unsigned>(h) < s_hMin)
-        s_hMin = static_cast<unsigned>(h);
-    if (static_cast<unsigned>(h) > s_hMax)
-        s_hMax = static_cast<unsigned>(h);
-    const LONG cmin = g_minStep;
-    if (cmin == 0x7FFFFFFF || !graph)
-        return h;
-    const unsigned w = *reinterpret_cast<const unsigned *>(static_cast<const char *>(graph) + 0x6C);
-    s_lastWidth = w;
-    if (w == 0 || w > 65535)
-        return h;
-    long long g = static_cast<long long>(cmin) * kGeoWeightPct / 100 *
-                  hex_lower_bound(static_cast<unsigned>(idx), static_cast<unsigned>(target), w);
-    if (g > 0x0FFFFFFF)
-        g = 0x0FFFFFFF;
-    ++s_geoUsed;
-    return static_cast<int>(g);
-}
+static void *__fastcall refine_site(
+    void *s, void * /*edx*/, void *res, uint32_t *vec, uint32_t from, uint32_t to, uint32_t arg) {
+    Refine_t orig = reinterpret_cast<Refine_t>(g_orig_refine);
+    uint32_t pos[4];
+    if (!g_inArrow || !g_memoOn || !vec || !memo_read_pos(s, pos))
+        return orig(s, res, vec, from, to, arg);
 
-// __fastcall with a dummy EDX == __thiscall layout; callee pops the 2 stack args (ret 8).
-static int __fastcall heur_geo_a(void *graph, void * /*edx*/, int idx, int target) {
-    return heur_geo(0, graph, idx, target);
-}
-static int __fastcall heur_geo_b(void *graph, void * /*edx*/, int idx, int target) {
-    return heur_geo(1, graph, idx, target);
+    MemoEntry *hit = nullptr;
+    for (MemoEntry &m : s_memo)
+        if (m.used && m.s == s && m.vec == vec && m.from == from && m.to == to && m.arg == arg &&
+            std::memcmp(m.pos, pos, sizeof(pos)) == 0) {
+            hit = &m;
+            break;
+        }
+    if (hit && vec[0] >= hit->n && (hit->n == 0 || vec[2] != 0)) {
+        if (g_guideVerify) {
+            // Verify: search for real and compare with the saved answer.
+            void *r = orig(s, res, vec, from, to, arg);
+            const uint32_t *rr = static_cast<const uint32_t *>(res);
+            const bool same = (rr[0] & 0xFF) == (hit->res[0] & 0xFF) && rr[1] == hit->res[1] && vec[1] == hit->n &&
+                              (hit->n == 0 ||
+                               std::memcmp(reinterpret_cast<const void *>(vec[2]), hit->hexes, hit->n * 4) == 0);
+            ++s_memoChecked;
+            if (!same && ++s_memoDiffs <= 30)
+                Log("[twdll] [MEMO] DIFFERENT: %08X -> %08X saved found %u cost %u (%u hexes), real found %u cost %u (%u hexes)",
+                    from,
+                    to,
+                    hit->res[0] & 0xFF,
+                    hit->res[1],
+                    hit->n,
+                    rr[0] & 0xFF,
+                    rr[1],
+                    vec[1]);
+            if (s_memoChecked % 200 == 0)
+                Log("[twdll] [MEMO] %ld saved answers checked against a real search: %ld different",
+                    s_memoChecked,
+                    s_memoDiffs);
+            return r;
+        }
+        uint32_t *r = static_cast<uint32_t *>(res);
+        r[0] = (r[0] & 0xFFFFFF00u) | (hit->res[0] & 0xFF);
+        r[1] = hit->res[1];
+        if (hit->n)
+            std::memcpy(reinterpret_cast<void *>(vec[2]), hit->hexes, hit->n * 4);
+        vec[1] = hit->n;
+        ++s_memoHits;
+        return res;
+    }
+    if (hit)
+        ++s_memoNoRoom;
+    void *r = orig(s, res, vec, from, to, arg);
+    ++s_memoMiss;
+    const uint32_t n = vec[1];
+    if (n > 100000 || (n && !vec[2]))
+        return r;
+    MemoEntry &m = hit ? *hit : s_memo[s_memoNext++ % kMemo];
+    free(m.hexes);
+    m = MemoEntry{};
+    if (n) {
+        m.hexes = static_cast<uint32_t *>(malloc(n * 4));
+        if (!m.hexes)
+            return r;
+        std::memcpy(m.hexes, reinterpret_cast<const void *>(vec[2]), n * 4);
+    }
+    const uint32_t *rr = static_cast<const uint32_t *>(res);
+    m.used = true;
+    m.s = s;
+    m.vec = vec;
+    m.from = from;
+    m.to = to;
+    m.arg = arg;
+    std::memcpy(m.pos, pos, sizeof(pos));
+    m.res[0] = rr[0];
+    m.res[1] = rr[1];
+    m.n = n;
+    return r;
 }
 
 // ---------------------------------------------------------------------------
-// Drag-arrow path measurement (temporary, no behaviour change).
-// FUN_11462e80 -> FUN_11416990 -> FUN_10a19080 (site B) runs while RMB-dragging.
-// Site A (FUN_10a0c5c0) measured for comparison.
+// Arrow route timing (measure only, the game's search runs unchanged).
+// FUN_11416990 -> FUN_10a19080 (site B) builds the route arrow; site A (FUN_10a0c5c0) is the
+// other caller. One [ARROW] line per 5 s while either runs (first 60 lines).
 // ---------------------------------------------------------------------------
 static constexpr uintptr_t FN_DRAG_PATH = 0x10A19080;
 static uintptr_t g_orig_drag_path = 0;
@@ -325,40 +1024,61 @@ struct DragStats {
 };
 static DragStats s_drag[2] = {};
 static DWORD s_dragLastReport = 0;
+static LONG s_dragReports = 0;
 
 static uint32_t drag_measure(int site, void *pf, int army, uint32_t *cell, void *out, long ctx) {
     const DWORD now = GetTickCount();
     if (s_dragLastReport == 0)
         s_dragLastReport = now;
     if (now - s_dragLastReport >= 5000) {
-        if constexpr (TWDLL_DEBUG_STATS != 0)
-        if (s_drag[0].calls || s_drag[1].calls)
-            Log("[twdll] [DRAG] last 5s: A(10a0c5c0) calls %ld, %.0f ms (max %.0f) | "
-                "B(11416990) calls %ld, %.0f ms (max %.0f), %.1f ms/call | nodes/call %.0f (a %ld "
-                "b %ld), "
-                "geo %ld, skipped closed %ld, avg step %.0f, minstep %ld, weight %d%%, width %u",
-                s_drag[0].calls,
-                s_drag[0].ms,
-                s_drag[0].maxMs,
+        if ((s_drag[0].calls || s_drag[1].calls) && s_dragReports < 60) {
+            ++s_dragReports;
+            Log("[twdll] [ARROW] last 5s: arrow route calls %ld, %.0f ms total, %.2f ms/call, max %.1f ms | "
+                "hover checks %ld, %.0f ms total | other calls %ld, %.0f ms | guide %s, used on %ld of %ld hexes",
                 s_drag[1].calls,
                 s_drag[1].ms,
-                s_drag[1].maxMs,
                 s_drag[1].calls ? s_drag[1].ms / s_drag[1].calls : 0.0,
-                s_drag[1].calls ? static_cast<double>(s_heurCalls) / s_drag[1].calls : 0.0,
-                s_heurA,
-                s_heurB,
-                s_geoUsed,
-                s_skipClosed,
-                s_stepCnt ? static_cast<double>(s_stepSum) / s_stepCnt : 0.0,
-                g_minStep,
-                kGeoWeightPct,
-                s_lastWidth);
-        s_heurCalls = s_geoUsed = s_heurA = s_heurB = s_stepCnt = s_skipClosed = 0;
-        s_stepSum = 0;
-        s_hMin = 0xFFFFFFFF;
-        s_hMax = 0;
+                s_drag[1].maxMs,
+                s_hvRuns,
+                s_hvMs,
+                s_drag[0].calls,
+                s_drag[0].ms,
+                g_guideOn ? "on" : "off",
+                s_guideUsed,
+                s_guideCalls);
+        }
+        if (s_drag[1].calls && s_dragReports <= 60) {
+            char line[1024];
+            int len = 0;
+            for (int i = 0; i < kLoops; ++i) {
+                if (!g_loopRuns[i] && !g_loopPops[i])
+                    continue;
+                const int n = snprintf(line + len,
+                                   sizeof(line) - len,
+                                   " | %08X: %ld runs, %ld hexes (%.0f per run)",
+                                   static_cast<unsigned int>(kLoopFn[i]),
+                                   g_loopRuns[i],
+                                   g_loopPops[i],
+                                   g_loopRuns[i] ? static_cast<double>(g_loopPops[i]) / g_loopRuns[i] : 0.0);
+                if (n < 0 || len + n >= static_cast<int>(sizeof(line)) - 1)
+                    break;
+                len += n;
+            }
+            Log("[twdll] [SEARCH] during %ld arrow routes:%s", s_drag[1].calls, len > 0 ? line : " no search loop ran");
+        }
+        for (int i = 0; i < kLoops; ++i)
+            g_loopRuns[i] = g_loopPops[i] = 0;
         s_drag[0] = DragStats{};
         s_drag[1] = DragStats{};
+        s_hvRuns = 0;
+        s_hvMs = 0.0;
+        s_guideUsed = s_guideCalls = 0;
+        if ((s_memoHits || s_memoMiss) && s_dragReports <= 60)
+            Log("[twdll] [MEMO] refine searches: %ld reused, %ld searched%s",
+                s_memoHits,
+                s_memoMiss,
+                s_memoNoRoom ? " (some saved answers did not fit the path buffer)" : "");
+        s_memoHits = s_memoMiss = s_memoNoRoom = 0;
         s_dragLastReport = now;
     }
 
@@ -379,14 +1099,21 @@ static uint32_t __fastcall drag_site_a(
     return drag_measure(0, pf, army, cell, out, ctx);
 }
 
-// Arrow preview. Weighted heuristic only while RMB is held; the release frame searches normally.
+// Arrow route: the game's own search, guided by the exact lower bound above.
 static uint32_t __fastcall drag_site_b(
     void *pf, void *, int army, uint32_t *cell, void *out, long ctx) {
-    const bool rmbDown = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
-    if (rmbDown)
-        g_heurThread = GetCurrentThreadId();
+    GuideScope gs(true);
+    const DWORD now = GetTickCount();
+    static DWORD s_memoStart = 0;
+    if (now - s_memoTick > 300 || s_memoGen != g_hover_gen || now - s_memoStart > 2000) {
+        s_memoStart = now;
+        memo_clear(); // new drag, or something moved since the saved answers
+        s_memoGen = g_hover_gen;
+    }
+    s_memoTick = now;
+    g_inArrow = 1;
     const uint32_t r = drag_measure(1, pf, army, cell, out, ctx);
-    g_heurThread = 0;
+    g_inArrow = 0;
     return r;
 }
 
@@ -415,12 +1142,35 @@ static Patch g_patches[] = {
     {"find_dcb0", 0x1158DD39, FN_FIND2, (void *)&fast_find, 4, 0, false}, // 8  drag: FUN_1158dcb0
     {"find_de80", 0x1158DF6A, FN_FIND2, (void *)&fast_find, 4, 0, false}, // 9  drag: FUN_1158de80
     {"drag_a", 0x10A0C5E7, FN_DRAG_PATH, (void *)&drag_site_a, -1, 0, false}, // 10 measure only
-    {"drag_b", 0x114169A2, FN_DRAG_PATH, (void *)&drag_site_b, -1, 0, false}, // 11 measure + heur
-                                                                              // flag
-    {"heur_geo_a", 0x10B9700A, FN_HEUR, (void *)&heur_geo_a, 11, 0, false},   // 12 in FUN_10b97000
-    {"heur_geo_b", 0x106B7CAE, FN_HEUR, (void *)&heur_geo_b, 11, 0, false},   // 13 in FUN_106b7ca0
-    {"relax_observe", 0x106BACC6, FN_RELAX, (void *)&relax_observe, 11, 0, false}, // 14 min step
-                                                                                   // cost
+    {"drag_b", 0x114169A2, FN_DRAG_PATH, (void *)&drag_site_b, -1, 0, false}, // 11 arrow + guide
+    // [SEARCH] diagnostics: one counter at each search loop's caller and heap pop
+    {"loop_106b8010", 0x106B7FEA, 0x106B8010, (void *)&loop_run_0, -1, 0, false},
+    {"pop_106b8010", 0x106B8052, FN_HEAP_POP, (void *)&loop_pop_0, -1, 0, false},
+    {"loop_106b8260", 0x106B823A, 0x106B8260, (void *)&loop_run_1, -1, 0, false},
+    {"pop_106b8260", 0x106B82A2, FN_HEAP_POP, (void *)&loop_pop_1, -1, 0, false},
+    {"loop_106b84b0", 0x106B848A, 0x106B84B0, (void *)&loop_run_2, -1, 0, false},
+    {"pop_106b84b0", 0x106B84F2, FN_HEAP_POP, (void *)&loop_pop_2, -1, 0, false},
+    {"loop_106b8700", 0x106B86DA, 0x106B8700, (void *)&loop_run_3, -1, 0, false},
+    {"pop_106b8700", 0x106B8742, FN_HEAP_POP, (void *)&loop_pop_3, -1, 0, false},
+    {"loop_10a0e0f0", 0x10A0E0CA, 0x10A0E0F0, (void *)&loop_run_4, -1, 0, false},
+    {"pop_10a0e0f0", 0x10A0E132, FN_HEAP_POP, (void *)&loop_pop_4, -1, 0, false},
+    {"loop_10a0e360", 0x10A0E33A, 0x10A0E360, (void *)&loop_run_5, -1, 0, false},
+    {"pop_10a0e360", 0x10A0E3A2, FN_HEAP_POP, (void *)&loop_pop_5, -1, 0, false},
+    {"loop_10aa3590", 0x10AA356A, 0x10AA3590, (void *)&loop_run_6, -1, 0, false},
+    {"pop_10aa3590", 0x10AA35D2, FN_HEAP_POP, (void *)&loop_pop_6, -1, 0, false},
+    {"loop_10aa3800", 0x10AA37DA, 0x10AA3800, (void *)&loop_run_7, -1, 0, false},
+    {"pop_10aa3800", 0x10AA3842, FN_HEAP_POP, (void *)&loop_pop_7, -1, 0, false},
+    {"loop_10b331b0", 0x10B3318A, 0x10B331B0, (void *)&loop_run_8, -1, 0, false},
+    {"pop_10b331b0", 0x10B331F4, FN_HEAP_POP, (void *)&loop_pop_8, -1, 0, false},
+    {"loop_10b33440", 0x10B3341A, 0x10B33440, (void *)&loop_run_9, -1, 0, false},
+    {"pop_10b33440", 0x10B33484, FN_HEAP_POP, (void *)&loop_pop_9, -1, 0, false},
+    {"loop_10b336d0", 0x10B336AA, 0x10B336D0, (void *)&loop_run_10, -1, 0, false},
+    {"pop_10b336d0", 0x10B33712, FN_HEAP_POP, (void *)&loop_pop_10, -1, 0, false},
+    {"loop_10b33920", 0x10B338FA, 0x10B33920, (void *)&loop_run_11, -1, 0, false},
+    {"pop_10b33920", 0x10B33962, FN_HEAP_POP, (void *)&loop_pop_11, -1, 0, false},
+    {"guide_heur_a", 0x10B9700A, FN_HEUR, (void *)&guide_site_a, -1, 0, false}, // in FUN_10b97000
+    {"guide_heur_b", 0x106B7CAE, FN_HEUR, (void *)&guide_site_b, -1, 0, false}, // in FUN_106b7ca0
+    {"route_memo", 0x10B41788, FN_REFINE_SEARCH, (void *)&refine_site, -1, 0, false}, // in FUN_10b415d0
 };
 static constexpr int PATCH_COUNT = sizeof(g_patches) / sizeof(g_patches[0]);
 
@@ -482,7 +1232,28 @@ void install_overlay_fix() {
     g_orig_can_reach = base + (FN_CAN_REACH - GH);
     g_orig_drag_path = base + (FN_DRAG_PATH - GH);
     g_orig_heur = base + (FN_HEUR - GH);
-    g_orig_relax = base + (FN_RELAX - GH);
+    for (int i = 0; i < kLoops; ++i)
+        g_loopOrig[i] = base + (kLoopFn[i] - GH);
+    g_popOrig = base + (FN_HEAP_POP - GH);
+    g_hex_dist = base + (FN_HEX_DIST - GH);
+    g_orig_refine = base + (FN_REFINE_SEARCH - GH);
+    {
+        char path[MAX_PATH];
+        const DWORD n = GetModuleFileNameA(nullptr, path, MAX_PATH);
+        char *slash = (n > 0 && n < MAX_PATH) ? strrchr(path, '\\') : nullptr;
+        if (slash && static_cast<size_t>(slash - path) + 32 < MAX_PATH) {
+            strcpy(slash + 1, "twdll_arrow_exact_off.txt");
+            g_guideOn = GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES;
+            strcpy(slash + 1, "twdll_arrow_verify.txt");
+            g_guideVerify = GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+            strcpy(slash + 1, "twdll_arrow_memo_off.txt");
+            g_memoOn = GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES;
+        }
+        Log("[twdll] [ARROW] exact guide %s, route memo %s%s",
+            g_guideOn ? "enabled" : "disabled (twdll_arrow_exact_off.txt)",
+            g_memoOn ? "enabled" : "disabled (twdll_arrow_memo_off.txt)",
+            g_guideVerify ? ", verify mode (twdll_arrow_verify.txt)" : "");
+    }
     g_interior_count = reinterpret_cast<const volatile DWORD *>(base + (DAT_INTERIOR_COUNT - GH));
 
     int ok = 0;
@@ -526,7 +1297,15 @@ void uninstall_overlay_fix() {
     s_count = 0;
     s_gen = -1;
     s_hover.valid = false;
-    g_heurThread = 0;
+    g_guideThread = 0;
+    g_guideWant = 0;
+    memo_clear();
+    for (GuideGraph &c : s_ggs) {
+        free(c.portalQ);
+        free(c.portalR);
+        c = GuideGraph{};
+    }
+    s_cur = &s_ggs[0];
     g_installed = false;
     Log("[twdll] [OVERLAY_FIX] restored original code");
 }
